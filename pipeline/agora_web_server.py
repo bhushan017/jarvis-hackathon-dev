@@ -1,10 +1,11 @@
 """Web server for Agora voice — serves browser RTC client + manages agent lifecycle.
 
 The browser handles all RTC audio (mic input, TTS playback).
-This server provides session config, starts/stops the agent, and
-processes datastream messages (tool calls from the agent).
+This server provides session config, starts/stops the agent,
+processes datastream messages (tool calls), and drives Reachy Mini.
 """
 
+import base64
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.agent_manager import AgentManager
+from pipeline.reachy_bridge import ReachyBridge
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STATIC_DIR = _PROJECT_ROOT / "static" / "agora"
 
 _agent_manager: AgentManager | None = None
+_reachy: ReachyBridge = ReachyBridge()
 
 
 class DatastreamPayload(BaseModel):
@@ -34,9 +37,57 @@ class DatastreamPayload(BaseModel):
     ts: int | None = None
 
 
+class AudioChunkPayload(BaseModel):
+    pcm_b64: str = ""
+    level: float = 0.0
+    sample_rate: int = 24000
+
+
+def _decode_packed(text: str) -> dict[str, Any] | None:
+    """Decode Agora packed datastream: parts separated by |, last part is base64 JSON."""
+    parts = text.split("|")
+    if len(parts) < 4:
+        return None
+    try:
+        decoded = base64.b64decode(parts[-1]).decode("utf-8")
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _dispatch_action(data: dict[str, Any]) -> None:
+    """Dispatch robot action from LLM tool call."""
+    action_type = str(data.get("action_type", "")).strip().lower()
+    if not action_type:
+        return
+
+    if action_type in ("display_emotion", "play_emotion", "emotion"):
+        emotion = data.get("emotion_type") or data.get("emotion", "")
+        if emotion:
+            _reachy.play_emotion(str(emotion))
+
+    elif action_type == "move_head":
+        direction = data.get("direction", "")
+        if direction:
+            _reachy.move_head(str(direction))
+
+    elif action_type == "wiggle":
+        _reachy.wiggle_antennas()
+
+    else:
+        logger.info("[action] Unknown action_type: %s", action_type)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Jarvis Agora Voice Server")
     app.mount("/static/agora", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.on_event("startup")
+    def on_startup():
+        # Connect to Reachy Mini
+        if _reachy.connect():
+            _reachy.wiggle_antennas()
 
     @app.get("/")
     def index():
@@ -53,8 +104,8 @@ def create_app() -> FastAPI:
             "channel": channel,
             "uid": uid,
             "token": "",
-            "deviceKeywords": ["Hollyland", "Wireless", "Shenzhen", "USB"],
-            "speakerKeywords": ["Bluetooth", "bluez", "A2DP"],
+            "deviceKeywords": ["Wireless", "Hollyland", "Shenzhen", "Reachy", "USB", "Pollen"],
+            "speakerKeywords": ["HK Onyx", "Bluetooth", "bluez", "A2DP"],
         }
 
     @app.post("/api/agora/agent/start")
@@ -83,50 +134,80 @@ def create_app() -> FastAPI:
             return {"ok": True}
         return {"ok": True, "reason": "not_running"}
 
+    @app.post("/api/motion/audio-chunk")
+    def motion_audio_chunk(payload: AudioChunkPayload) -> dict[str, Any]:
+        """Receive TTS audio chunk from browser for head wobble."""
+        if payload.level > 0.01:
+            logger.info("[audio] level=%.3f", payload.level)
+            _reachy.feed_audio_chunk(payload.level)
+        return {"ok": True}
+
+    @app.post("/api/motion/session")
+    def motion_session(payload: dict[str, Any]) -> dict[str, Any]:
+        """Session state from browser."""
+        active = payload.get("active", False)
+        _reachy.set_speaking(False)
+        return {"ok": True}
+
     @app.post("/api/datastream/message")
     async def datastream_message(payload: DatastreamPayload) -> dict[str, Any]:
-        """Process datastream messages from the agent (tool calls, etc.)."""
+        """Process datastream messages from the agent."""
         text = payload.text
         if not text:
             return {"ok": True}
 
-        # Try to parse as JSON
+        # Try direct JSON
+        data = None
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            # Try packed format: parts separated by |, last part is base64
-            parts = text.split("|")
-            if len(parts) >= 4:
-                try:
-                    import base64
-                    decoded = base64.b64decode(parts[-1]).decode("utf-8")
-                    data = json.loads(decoded)
-                except Exception:
-                    data = None
-            else:
-                data = None
+            data = _decode_packed(text)
 
-        if data and isinstance(data, dict):
-            obj_type = data.get("object", "")
-            if obj_type == "message.user":
-                content = data.get("content", "")
-                logger.info("[datastream] User said: %s", content)
-            elif "tool" in obj_type or "function" in str(data):
-                logger.info("[datastream] Tool call: %s", json.dumps(data)[:200])
-            else:
-                logger.debug("[datastream] %s", json.dumps(data)[:200])
+        if not data or not isinstance(data, dict):
+            return {"ok": True}
+
+        obj_type = data.get("object", "")
+
+        # Conversation state (speaking/listening)
+        if obj_type == "message.state":
+            state = str(data.get("state", "")).lower()
+            _reachy.set_speaking(state == "speaking")
+            logger.info("[datastream] State: %s", state)
+
+        # User speech transcription
+        elif obj_type == "message.user":
+            content = data.get("content", "")
+            logger.info("[datastream] User: %s", content)
+
+        # Tool call / action from LLM
+        else:
+            # Try to extract action payload (may be nested in content)
+            action = data
+            content = data.get("content")
+            if isinstance(content, str):
+                try:
+                    action = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            elif isinstance(content, dict):
+                action = content
+
+            if isinstance(action, dict) and action.get("action_type"):
+                logger.info("[datastream] Action: %s", json.dumps(action)[:200])
+                _dispatch_action(action)
 
         return {"ok": True}
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok"}
+        return {"status": "ok", "reachy": _reachy.connected}
 
     @app.on_event("shutdown")
     def on_shutdown():
         if _agent_manager and _agent_manager.is_running():
-            logger.info("Stopping agent on server shutdown...")
+            logger.info("Stopping agent...")
             _agent_manager.stop_agent()
+        _reachy.disconnect()
 
     return app
 
@@ -172,7 +253,6 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-    # Load .env
     env_path = _PROJECT_ROOT / ".env"
     if env_path.exists():
         with open(env_path) as f:

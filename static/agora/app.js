@@ -4,6 +4,10 @@ const logEl = document.getElementById("log");
 let client = null;
 let localAudioTrack = null;
 let session = null;
+let remoteAnalyserCtx = null;
+let remoteAudioSource = null;
+let remoteProcessor = null;
+let remoteMuteGain = null;
 
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -40,19 +44,75 @@ async function postStartAgent() {
 }
 
 async function pickDevice(devices, keywords, kind) {
-  // Try to match by keywords
   const match = devices.find(d => matchKeywords(d.label, keywords));
   if (match) {
     log(`Found ${kind}: ${match.label}`);
     return match;
   }
-  // Fallback to first available
   if (devices.length > 0) {
-    log(`${kind} not matched by keywords, using: ${devices[0].label}`);
+    log(`${kind} not matched, using: ${devices[0].label}`);
     return devices[0];
   }
   throw new Error(`No ${kind} device found`);
 }
+
+// --- Audio analysis for robot head wobble ---
+
+function stopRemoteAudio() {
+  if (remoteProcessor) { try { remoteProcessor.disconnect(); } catch(_){} remoteProcessor = null; }
+  if (remoteAudioSource) { try { remoteAudioSource.disconnect(); } catch(_){} remoteAudioSource = null; }
+  if (remoteMuteGain) { try { remoteMuteGain.disconnect(); } catch(_){} remoteMuteGain = null; }
+  if (remoteAnalyserCtx) { remoteAnalyserCtx.close().catch(()=>{}); remoteAnalyserCtx = null; }
+}
+
+function startRemoteAudioAnalysis(audioTrack) {
+  stopRemoteAudio();
+  if (!audioTrack?.getMediaStreamTrack) return;
+
+  try {
+    const msTrack = audioTrack.getMediaStreamTrack();
+    const stream = new MediaStream([msTrack]);
+    remoteAnalyserCtx = new (window.AudioContext || window.webkitAudioContext)();
+    remoteAudioSource = remoteAnalyserCtx.createMediaStreamSource(stream);
+    remoteProcessor = remoteAnalyserCtx.createScriptProcessor(512, 1, 1);
+    remoteMuteGain = remoteAnalyserCtx.createGain();
+    remoteMuteGain.gain.value = 0.0; // Don't double-play, just analyze
+
+    remoteAudioSource.connect(remoteProcessor);
+    remoteProcessor.connect(remoteMuteGain);
+    remoteMuteGain.connect(remoteAnalyserCtx.destination);
+
+    if (remoteAnalyserCtx.state === "suspended") {
+      remoteAnalyserCtx.resume().catch(()=>{});
+    }
+
+    remoteProcessor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      if (!input || input.length === 0) return;
+
+      // Compute RMS energy level
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      const rms = Math.sqrt(sum / input.length);
+      const level = Math.min(Math.max(rms * 4.0, 0), 1);
+
+      // Send to backend for robot head wobble
+      if (level > 0.01) {
+        fetch("/api/motion/audio-chunk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pcm_b64: "", level, sample_rate: 16000 }),
+          keepalive: true,
+        }).catch(()=>{});
+      }
+    };
+    log("Remote audio analysis started (for robot wobble)");
+  } catch (err) {
+    log(`Audio analysis init failed: ${err.message}`);
+  }
+}
+
+// --- Main flow ---
 
 async function join() {
   if (client) return;
@@ -62,7 +122,7 @@ async function join() {
 
   client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
 
-  // Handle datastream messages from agent (tool calls, etc.)
+  // Handle datastream messages from agent (tool calls, state, etc.)
   client.on("stream-message", async (...args) => {
     let data;
     if (args.length >= 3) data = args[2];
@@ -78,7 +138,7 @@ async function join() {
       else text = String(data);
     } catch (e) { return; }
 
-    // Forward to backend for processing
+    // Forward to backend for robot actions + logging
     try {
       await fetch("/api/datastream/message", {
         method: "POST",
@@ -94,7 +154,6 @@ async function join() {
     await client.subscribe(user, mediaType);
     log(`Subscribed to agent ${mediaType} (uid ${user.uid})`);
     if (mediaType === "audio") {
-      // Route to selected speaker
       if (user.audioTrack?.setPlaybackDevice && session.speakerDeviceId) {
         try {
           await user.audioTrack.setPlaybackDevice(session.speakerDeviceId);
@@ -102,6 +161,8 @@ async function join() {
           log(`Speaker routing failed: ${e.message}`);
         }
       }
+      // Start audio analysis for robot head wobble
+      startRemoteAudioAnalysis(user.audioTrack);
       user.audioTrack.play();
       log("Agent audio playing");
     }
@@ -109,9 +170,12 @@ async function join() {
 
   client.on("user-unpublished", (user, mediaType) => {
     log(`Agent ${mediaType} unpublished (uid ${user.uid})`);
+    if (mediaType === "audio") {
+      stopRemoteAudio();
+    }
   });
 
-  // Get mic permission first
+  // Get mic permission
   await navigator.mediaDevices.getUserMedia({ audio: true });
 
   const mics = await AgoraRTC.getMicrophones();
@@ -119,17 +183,16 @@ async function join() {
   log(`Mics: ${mics.map(m => m.label).join(", ")}`);
   log(`Speakers: ${speakers.map(s => s.label).join(", ")}`);
 
-  const keywords = session.deviceKeywords || ["Hollyland", "Wireless", "Shenzhen", "USB"];
+  const keywords = session.deviceKeywords || ["Reachy", "Hollyland", "Wireless", "USB"];
   const mic = await pickDevice(mics, keywords, "microphone");
 
-  // Find Bluetooth or USB speaker
-  const spkKeywords = session.speakerKeywords || ["Bluetooth", "bluez", "A2DP"];
+  const spkKeywords = session.speakerKeywords || ["Reachy", "Bluetooth", "bluez", "Pollen"];
   let speaker = null;
   try {
     speaker = await pickDevice(speakers, spkKeywords, "speaker");
     session.speakerDeviceId = speaker.deviceId;
   } catch (_) {
-    log("No Bluetooth speaker found, using default output");
+    log("No matched speaker, using default output");
   }
 
   localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack({
@@ -139,12 +202,27 @@ async function join() {
   await client.join(session.appId, session.channel, session.token || null, session.uid || null);
   log("Joined channel, starting agent...");
 
+  // Notify backend session is active
+  fetch("/api/motion/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active: true }),
+  }).catch(()=>{});
+
   await postStartAgent();
   await client.publish([localAudioTrack]);
   setStatus(`Connected to ${session.channel} as uid ${session.uid}`);
 }
 
 async function leave() {
+  fetch("/api/motion/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active: false }),
+    keepalive: true,
+  }).catch(()=>{});
+
+  stopRemoteAudio();
   if (localAudioTrack) {
     localAudioTrack.stop();
     localAudioTrack.close();
@@ -158,7 +236,6 @@ async function leave() {
   setStatus("Disconnected");
 }
 
-// Auto-join on load
 window.addEventListener("load", async () => {
   try {
     await join();

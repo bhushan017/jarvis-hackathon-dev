@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--no-openclaw", action="store_true", help="Skip OpenClaw routing")
     parser.add_argument("--agora", action="store_true", help="Use Agora Conversational AI (cloud ASR+LLM+TTS)")
     parser.add_argument("--agora-channel", default=None, help="Agora channel name (default: from AGORA_CHANNEL env)")
-    parser.add_argument("--proxy-port", type=int, default=8000, help="LLM proxy port for Agora (default: 8000)")
+    parser.add_argument("--proxy-port", type=int, default=8001, help="MCP tool server port (default: 8001)")
     parser.add_argument("--ambient-only", action="store_true", help="Only ambient mode")
     parser.add_argument("--engaged-only", action="store_true", help="Only engaged mode (test conversation)")
     parser.add_argument("--vlm-backend", default="transformers", choices=["transformers", "llama_cpp"],
