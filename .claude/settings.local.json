@@ -8,7 +8,8 @@
       "Bash(grep -r BeatNet /home/alex/Desktop/jarvis-hackathon-dev --include=*.py --include=*.txt --include=*.md)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:archives.ismir.net)"
+      "WebFetch(domain:archives.ismir.net)",
+      "Bash(python:*)"
     ]
   }
 }
